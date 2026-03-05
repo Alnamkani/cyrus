@@ -32,7 +32,7 @@ program
 	.option(
 		"--cyrus-home <path>",
 		"Specify custom Cyrus config directory",
-		resolve(homedir(), ".cyrus"),
+		resolve(homedir(), ".cyrus-dev"),
 	)
 	.option("--env-file <path>", "Path to environment variables file");
 

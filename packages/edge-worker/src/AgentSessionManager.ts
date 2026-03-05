@@ -44,6 +44,10 @@ export interface AgentSessionManagerEvents {
 		sessionId: string;
 		session: CyrusAgentSession;
 	}) => void;
+	procedureComplete: (data: {
+		sessionId: string;
+		session: CyrusAgentSession;
+	}) => void;
 	/**
 	 * Emitted when validation fails and we need to run the validation-fixer
 	 * The EdgeWorker should respond by running the fixer prompt and then re-running verifications
@@ -635,6 +639,11 @@ export class AgentSessionManager extends EventEmitter {
 			// Procedure complete - post final result
 			log.info(`All subroutines completed, posting final result to Linear`);
 			await this.addResultEntry(sessionId, resultMessage);
+
+			this.emit("procedureComplete", {
+				sessionId,
+				session,
+			});
 
 			// Handle child session completion
 			const isChildSession = this.getParentSessionId?.(sessionId);

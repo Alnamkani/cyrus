@@ -29,6 +29,7 @@ import type {
 	InternalMessage,
 	Issue,
 	IssueMinimal,
+	IssueStateChangeWebhook,
 	IssueUnassignedWebhook,
 	IssueUpdateWebhook,
 	RepositoryConfig,
@@ -36,6 +37,7 @@ import type {
 	SerializedCyrusAgentSession,
 	SerializedCyrusAgentSessionEntry,
 	SessionStartMessage,
+	StateChangeBehavior,
 	StopSignalMessage,
 	UnassignMessage,
 	UserPromptMessage,
@@ -55,6 +57,7 @@ import {
 	isIssueAssignedWebhook,
 	isIssueCommentMentionWebhook,
 	isIssueNewCommentWebhook,
+	isIssueStateChangeWebhook,
 	isIssueTitleOrDescriptionUpdateWebhook,
 	isIssueUnassignedWebhook,
 	isSessionStartMessage,
@@ -189,6 +192,7 @@ export class EdgeWorker extends EventEmitter {
 	private activeWebhookCount = 0; // Track number of webhooks currently being processed
 	/** Handler for AskUserQuestion tool invocations via Linear select signal */
 	private askUserQuestionHandler: AskUserQuestionHandler;
+	private pendingAgentStateChanges: Set<string> = new Set();
 	/** User access control for whitelisting/blacklisting Linear users */
 	private userAccessControl: UserAccessControl;
 	private logger: ILogger;
@@ -397,6 +401,18 @@ export class EdgeWorker extends EventEmitter {
 						);
 					},
 				);
+
+				agentSessionManager.on("procedureComplete", async ({ session }) => {
+					const completedName = this.getJustCompletedSubroutineName(session);
+					if (completedName) {
+						await this.applySubroutineStateTransition(
+							completedName,
+							session,
+							repo,
+							this.logger,
+						);
+					}
+				});
 
 				// Subscribe to validation loop events
 				agentSessionManager.on(
@@ -1636,6 +1652,17 @@ ${taskSection}`;
 		// Get next subroutine (advancement already handled by AgentSessionManager)
 		const nextSubroutine = this.procedureAnalyzer.getCurrentSubroutine(session);
 
+		const completedSubroutineName =
+			this.getJustCompletedSubroutineName(session);
+		if (completedSubroutineName) {
+			await this.applySubroutineStateTransition(
+				completedSubroutineName,
+				session,
+				repo,
+				log,
+			);
+		}
+
 		if (!nextSubroutine) {
 			log.info(`Procedure complete for session ${sessionId}`);
 			return;
@@ -1864,6 +1891,18 @@ ${taskSection}`;
 						);
 					},
 				);
+
+				agentSessionManager.on("procedureComplete", async ({ session }) => {
+					const completedName = this.getJustCompletedSubroutineName(session);
+					if (completedName) {
+						await this.applySubroutineStateTransition(
+							completedName,
+							session,
+							repo,
+							this.logger,
+						);
+					}
+				});
 
 				// Subscribe to validation loop events
 				agentSessionManager.on(
@@ -2108,8 +2147,12 @@ ${taskSection}`;
 				await this.handleAgentSessionCreatedWebhook(webhook, repos);
 			} else if (isAgentSessionPromptedWebhook(webhook)) {
 				await this.handleUserPromptedAgentActivity(webhook);
+			} else if (isIssueStateChangeWebhook(webhook)) {
+				await this.handleIssueStateChange(webhook);
+				if (isIssueTitleOrDescriptionUpdateWebhook(webhook)) {
+					await this.handleIssueContentUpdate(webhook);
+				}
 			} else if (isIssueTitleOrDescriptionUpdateWebhook(webhook)) {
-				// Handle issue title/description/attachments updates - feed changes into active session
 				await this.handleIssueContentUpdate(webhook);
 			} else {
 				if (process.env.CYRUS_WEBHOOK_DEBUG === "true") {
@@ -2590,6 +2633,7 @@ ${taskSection}`;
 		issue: { id: string; identifier: string },
 		repository: RepositoryConfig,
 		agentSessionManager: AgentSessionManager,
+		skipStateTransition = false,
 	): Promise<AgentSessionData> {
 		// Fetch full Linear issue details
 		const fullIssue = await this.fetchFullIssueDetails(issue.id, repository.id);
@@ -2597,8 +2641,9 @@ ${taskSection}`;
 			throw new Error(`Failed to fetch full issue details for ${issue.id}`);
 		}
 
-		// Move issue to started state automatically, in case it's not already
-		await this.moveIssueToStartedState(fullIssue, repository.id);
+		if (!skipStateTransition && this.config.skipAutoStartedState !== true) {
+			await this.moveIssueToStartedState(fullIssue, repository.id);
+		}
 
 		// Create workspace using full issue data
 		// Use custom handler if provided, otherwise create a git worktree by default
@@ -2825,6 +2870,14 @@ ${taskSection}`;
 		const AGENT_SESSION_MARKER = "This thread is for an agent session";
 		const isMentionTriggered =
 			commentBody && !commentBody.includes(AGENT_SESSION_MARKER);
+
+		if (!isMentionTriggered && this.config.delegationTrigger === false) {
+			log.info(
+				`Delegation trigger disabled, ignoring delegation for ${issue.identifier}`,
+			);
+			return;
+		}
+
 		// Check if the comment contains the /label-based-prompt command
 		const isLabelBasedPromptRequested = commentBody?.includes(
 			"/label-based-prompt",
@@ -3723,6 +3776,421 @@ ${taskSection}`;
 		);
 	}
 
+	private async handleIssueStateChange(
+		webhook: IssueStateChangeWebhook,
+	): Promise<void> {
+		if (this.config.issueStateChangeTrigger === false) {
+			if (process.env.CYRUS_WEBHOOK_DEBUG === "true") {
+				this.logger.debug("Issue state change trigger is disabled, skipping");
+			}
+			return;
+		}
+
+		const issueData = webhook.data;
+		const issueId = issueData.id;
+		const issueIdentifier = issueData.identifier;
+
+		if (this.pendingAgentStateChanges.has(issueId)) {
+			this.logger.debug(
+				`Ignoring self-initiated state change for ${issueIdentifier}`,
+			);
+			return;
+		}
+
+		const newState = issueData.state;
+		if (!newState) {
+			this.logger.warn(
+				`State change webhook for ${issueIdentifier} has no state data`,
+			);
+			return;
+		}
+
+		let repository = this.getCachedRepository(issueId);
+		if (!repository) {
+			for (const [repoId, manager] of this.agentSessionManagers) {
+				const sessions = manager.getSessionsByIssueId(issueId);
+				if (sessions.length > 0) {
+					repository = this.repositories.get(repoId) ?? null;
+					if (repository) {
+						this.logger.info(
+							`Recovered repository ${repoId} for state change ${issueIdentifier} from session manager`,
+						);
+						break;
+					}
+				}
+			}
+
+			if (!repository) {
+				this.logger.debug(
+					`No active sessions found for state change ${issueIdentifier} across all managers, ignoring`,
+				);
+				return;
+			}
+		}
+
+		const behavior = this.resolveStateChangeBehavior(
+			newState as { name: string; type: string },
+			repository,
+		);
+
+		this.logger.info(
+			`State change for ${issueIdentifier}: "${newState.name}" (type: ${newState.type}) → behavior: ${behavior}`,
+		);
+
+		if (behavior === "ignore") {
+			return;
+		}
+
+		if (behavior === "cancel") {
+			await this.handleStateChangeCancellation(
+				issueId,
+				issueIdentifier,
+				newState.name as string,
+				repository,
+			);
+			return;
+		}
+
+		await this.stopExistingSessionsForIssue(issueId, repository);
+		await this.launchStateChangeSession(
+			issueId,
+			issueIdentifier,
+			repository,
+			behavior,
+		);
+	}
+
+	private resolveStateChangeBehavior(
+		state: { name: string; type: string },
+		repository: RepositoryConfig,
+	): StateChangeBehavior {
+		const repoMapping = repository.stateChangeMapping;
+		const repoByName = repoMapping?.stateNames?.[state.name];
+		if (repoByName) return repoByName;
+		const repoByType = repoMapping?.stateTypes?.[state.type];
+		if (repoByType) return repoByType;
+
+		const globalMapping = this.config.stateChangeMapping;
+		if (process.env.CYRUS_WEBHOOK_DEBUG === "true") {
+			this.logger.debug(
+				`State resolution: name="${state.name}" type="${state.type}" globalMapping=${JSON.stringify(globalMapping)}`,
+			);
+		}
+		const globalByName = globalMapping?.stateNames?.[state.name];
+		if (globalByName) return globalByName;
+		const globalByType = globalMapping?.stateTypes?.[state.type];
+		if (globalByType) return globalByType;
+
+		const builtInDefaults: Record<string, StateChangeBehavior> = {
+			started: "implement",
+			canceled: "cancel",
+			completed: "cancel",
+		};
+		return builtInDefaults[state.type] ?? "ignore";
+	}
+
+	private async handleStateChangeCancellation(
+		issueId: string,
+		issueIdentifier: string,
+		stateName: string,
+		repository: RepositoryConfig,
+	): Promise<void> {
+		const agentSessionManager = this.agentSessionManagers.get(repository.id);
+		if (!agentSessionManager) {
+			this.logger.info(
+				"No agentSessionManager for state change cancellation, no sessions to stop",
+			);
+			return;
+		}
+
+		const sessions = agentSessionManager.getSessionsByIssueId(issueId);
+		const activeThreadCount = sessions.length;
+
+		for (const session of sessions) {
+			this.logger.info(
+				`Stopping agent runner for issue ${issueIdentifier} (state → ${stateName})`,
+			);
+			agentSessionManager.requestSessionStop(session.id);
+			session.agentRunner?.stop();
+		}
+
+		if (activeThreadCount > 0) {
+			await this.postComment(
+				issueId,
+				`Issue moved to "${stateName}". Stopping work and cleaning up.`,
+				repository.id,
+			);
+		}
+
+		this.logger.info(
+			`Stopped ${activeThreadCount} sessions for issue ${issueIdentifier} (state → ${stateName})`,
+		);
+	}
+
+	private async stopExistingSessionsForIssue(
+		issueId: string,
+		repository: RepositoryConfig,
+	): Promise<void> {
+		const agentSessionManager = this.agentSessionManagers.get(repository.id);
+		if (!agentSessionManager) return;
+
+		const sessions = agentSessionManager.getSessionsByIssueId(issueId);
+		for (const session of sessions) {
+			agentSessionManager.requestSessionStop(session.id);
+			session.agentRunner?.stop();
+		}
+	}
+
+	private async launchStateChangeSession(
+		issueId: string,
+		issueIdentifier: string,
+		repository: RepositoryConfig,
+		behavior: "plan" | "implement" | "debug",
+	): Promise<void> {
+		const agentSessionManager = this.agentSessionManagers.get(repository.id);
+		if (!agentSessionManager) {
+			this.logger.error(
+				`No agentSessionManager for repository ${repository.id}, cannot launch state change session`,
+			);
+			return;
+		}
+
+		const log = this.logger.withContext({
+			issueIdentifier,
+		});
+
+		log.info(`Launching state change session (behavior: ${behavior})`);
+
+		const procedureName =
+			behavior === "plan"
+				? "plan-mode"
+				: behavior === "debug"
+					? "debugger-full"
+					: "full-development";
+		const procedure = this.procedureAnalyzer.getProcedure(procedureName);
+		if (!procedure) {
+			log.error(`Procedure "${procedureName}" not found in registry`);
+			return;
+		}
+
+		try {
+			const issueTracker = this.issueTrackers.get(repository.id);
+			if (!issueTracker) {
+				log.error(`No issue tracker for repository ${repository.id}`);
+				return;
+			}
+
+			const agentSessionPayload = await issueTracker.createAgentSessionOnIssue({
+				issueId,
+			});
+			const agentSession = await agentSessionPayload.agentSession;
+			if (!agentSession) {
+				log.error("Failed to create Linear agent session");
+				return;
+			}
+			const sessionId = agentSession.id;
+			log.info(`Created Linear agent session: ${sessionId}`);
+
+			const sessionData = await this.createLinearAgentSession(
+				sessionId,
+				{ id: issueId, identifier: issueIdentifier },
+				repository,
+				agentSessionManager,
+				true,
+			);
+
+			const { session, fullIssue, attachmentResult, allowedDirectories } =
+				sessionData;
+
+			if (!session.metadata) {
+				session.metadata = {};
+			}
+
+			this.procedureAnalyzer.initializeProcedureMetadata(session, procedure);
+
+			const classification: RequestClassification =
+				behavior === "plan"
+					? "planning"
+					: behavior === "debug"
+						? "debugger"
+						: "code";
+
+			await agentSessionManager.postProcedureSelectionThought(
+				sessionId,
+				procedure.name,
+				classification,
+			);
+
+			const labels = await this.fetchIssueLabels(fullIssue);
+
+			const input: PromptAssemblyInput = {
+				session,
+				fullIssue,
+				repository,
+				userComment: "",
+				attachmentManifest: attachmentResult.manifest,
+				labels,
+				isNewSession: true,
+				isStreaming: false,
+				isMentionTriggered: false,
+				isLabelBasedPromptRequested: false,
+			};
+
+			const assembly = await this.assemblePrompt(input);
+
+			const systemPromptResult = await this.determineSystemPromptFromLabels(
+				labels,
+				repository,
+			);
+			const promptType = systemPromptResult?.type;
+
+			const currentSubroutine =
+				this.procedureAnalyzer.getCurrentSubroutine(session);
+
+			const allowedTools = currentSubroutine?.disallowAllTools
+				? []
+				: this.buildAllowedTools(repository, promptType);
+			const baseDisallowedTools = this.buildDisallowedTools(
+				repository,
+				promptType,
+			);
+			const disallowedTools = this.mergeSubroutineDisallowedTools(
+				session,
+				baseDisallowedTools,
+				"EdgeWorker",
+			);
+
+			const { config: runnerConfig, runnerType } = this.buildAgentRunnerConfig(
+				session,
+				repository,
+				sessionId,
+				assembly.systemPrompt,
+				allowedTools,
+				allowedDirectories,
+				disallowedTools,
+				undefined,
+				labels,
+				fullIssue.description || undefined,
+				undefined,
+				currentSubroutine?.singleTurn,
+				currentSubroutine?.disallowAllTools,
+			);
+
+			const runner =
+				runnerType === "claude"
+					? new ClaudeRunner(runnerConfig)
+					: runnerType === "gemini"
+						? new GeminiRunner(runnerConfig)
+						: runnerType === "codex"
+							? new CodexRunner(runnerConfig)
+							: new CursorRunner(runnerConfig);
+
+			agentSessionManager.addAgentRunner(sessionId, runner);
+
+			await this.savePersistedState();
+
+			this.emit("session:started", fullIssue.id, fullIssue, repository.id);
+			this.config.handlers?.onSessionStart?.(
+				fullIssue.id,
+				fullIssue,
+				repository.id,
+			);
+
+			if (
+				systemPromptResult?.version &&
+				"updatePromptVersions" in runner &&
+				typeof runner.updatePromptVersions === "function"
+			) {
+				runner.updatePromptVersions({
+					systemPromptVersion: systemPromptResult.version,
+				});
+			}
+
+			if (runner.supportsStreamingInput && runner.startStreaming) {
+				const sessionInfo = await runner.startStreaming(assembly.userPrompt);
+				log.debug(`Streaming session started: ${sessionInfo.sessionId}`);
+			} else {
+				const sessionInfo = await runner.start(assembly.userPrompt);
+				log.debug(`Non-streaming session started: ${sessionInfo.sessionId}`);
+			}
+
+			log.info(
+				`State change session launched successfully (procedure: ${procedureName}, runner: ${runnerType})`,
+			);
+		} catch (error) {
+			log.error(`Failed to launch state change session:`, error);
+		}
+	}
+
+	private getJustCompletedSubroutineName(
+		session: CyrusAgentSession,
+	): string | null {
+		const procedureMetadata = session.metadata?.procedure as
+			| { subroutineHistory?: { subroutine: string }[] }
+			| undefined;
+		if (!procedureMetadata?.subroutineHistory?.length) return null;
+		const last =
+			procedureMetadata.subroutineHistory[
+				procedureMetadata.subroutineHistory.length - 1
+			];
+		return last?.subroutine ?? null;
+	}
+
+	private async applySubroutineStateTransition(
+		completedSubroutineName: string,
+		session: CyrusAgentSession,
+		repository: RepositoryConfig,
+		log: ILogger,
+	): Promise<void> {
+		const transitions = this.config.subroutineStateTransitions;
+		if (!transitions) return;
+
+		const targetStateName = transitions[completedSubroutineName];
+		if (!targetStateName) return;
+
+		const issueId = session.issueId;
+		if (!issueId) return;
+
+		log.info(
+			`Subroutine "${completedSubroutineName}" completed → moving issue to "${targetStateName}"`,
+		);
+
+		try {
+			const issueTracker = this.issueTrackers.get(repository.id);
+			if (!issueTracker) return;
+
+			const issue = await issueTracker.fetchIssue(issueId);
+			const team = await issue.team;
+			if (!team) return;
+
+			const teamStates = await issueTracker.fetchWorkflowStates(team.id);
+			const targetState = teamStates.nodes.find(
+				(s) => s.name === targetStateName,
+			);
+			if (!targetState) {
+				log.warn(
+					`Target state "${targetStateName}" not found in team workflow states`,
+				);
+				return;
+			}
+
+			this.pendingAgentStateChanges.add(issueId);
+			await issueTracker.updateIssue(issueId, { stateId: targetState.id });
+			setTimeout(() => {
+				this.pendingAgentStateChanges.delete(issueId);
+			}, 30_000);
+
+			log.info(
+				`Moved issue to "${targetStateName}" after "${completedSubroutineName}" subroutine`,
+			);
+		} catch (error) {
+			log.error(
+				`Failed to transition issue state after "${completedSubroutineName}":`,
+				error,
+			);
+		}
+	}
+
 	/**
 	 * Handle Claude messages
 	 */
@@ -4035,12 +4503,17 @@ ${taskSection}`;
 				return;
 			}
 
+			this.pendingAgentStateChanges.add(issue.id);
 			await issueTracker.updateIssue(issue.id, {
 				stateId: startedState.id,
 			});
 
+			setTimeout(() => {
+				this.pendingAgentStateChanges.delete(issue.id);
+			}, 30_000);
+
 			this.logger.debug(
-				`✅ Successfully moved issue ${issue.identifier} to ${startedState.name} state`,
+				`Successfully moved issue ${issue.identifier} to ${startedState.name} state`,
 			);
 		} catch (error) {
 			this.logger.error(
