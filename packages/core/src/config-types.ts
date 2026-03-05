@@ -16,6 +16,8 @@ export {
 	type RepositoryConfigPayload,
 	RepositoryConfigPayloadSchema,
 	RepositoryConfigSchema,
+	type StateChangeBehavior,
+	type StateChangeMapping,
 	type UserAccessControlConfig,
 	UserAccessControlConfigSchema,
 	type UserIdentifier,

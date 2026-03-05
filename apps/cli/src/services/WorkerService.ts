@@ -232,6 +232,11 @@ export class WorkerService {
 			ngrokAuthToken,
 			// User access control configuration
 			userAccessControl: edgeConfig.userAccessControl,
+			issueStateChangeTrigger: edgeConfig.issueStateChangeTrigger,
+			stateChangeMapping: edgeConfig.stateChangeMapping,
+			delegationTrigger: edgeConfig.delegationTrigger,
+			skipAutoStartedState: edgeConfig.skipAutoStartedState,
+			subroutineStateTransitions: edgeConfig.subroutineStateTransitions,
 			handlers: {
 				createWorkspace: async (
 					issue: Issue,

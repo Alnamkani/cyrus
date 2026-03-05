@@ -118,6 +118,19 @@ const PromptDefaultsSchema = z.object({
 	"graphite-orchestrator": PromptTypeDefaultsSchema.optional(),
 });
 
+const StateChangeBehaviorSchema = z.enum([
+	"plan",
+	"implement",
+	"debug",
+	"cancel",
+	"ignore",
+]);
+
+const StateChangeMappingSchema = z.object({
+	stateTypes: z.record(z.string(), StateChangeBehaviorSchema).optional(),
+	stateNames: z.record(z.string(), StateChangeBehaviorSchema).optional(),
+});
+
 /**
  * Configuration for a single repository/workspace pair
  */
@@ -158,6 +171,8 @@ export const RepositoryConfigSchema = z.object({
 
 	// Repository-specific user access control
 	userAccessControl: UserAccessControlConfigSchema.optional(),
+
+	stateChangeMapping: StateChangeMappingSchema.optional(),
 });
 
 /**
@@ -235,6 +250,16 @@ export const EdgeConfigSchema = z.object({
 
 	/** Global defaults for prompt types (tool restrictions per prompt type) */
 	promptDefaults: PromptDefaultsSchema.optional(),
+
+	issueStateChangeTrigger: z.boolean().optional(),
+
+	stateChangeMapping: StateChangeMappingSchema.optional(),
+
+	delegationTrigger: z.boolean().optional(),
+
+	skipAutoStartedState: z.boolean().optional(),
+
+	subroutineStateTransitions: z.record(z.string(), z.string()).optional(),
 });
 
 /**
@@ -260,6 +285,8 @@ export type UserAccessControlConfig = z.infer<
 >;
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 export type EdgeConfig = z.infer<typeof EdgeConfigSchema>;
+export type StateChangeBehavior = z.infer<typeof StateChangeBehaviorSchema>;
+export type StateChangeMapping = z.infer<typeof StateChangeMappingSchema>;
 export type RepositoryConfigPayload = z.infer<
 	typeof RepositoryConfigPayloadSchema
 >;

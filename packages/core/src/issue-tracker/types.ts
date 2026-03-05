@@ -812,6 +812,17 @@ export type IssueUpdateWebhook =
 		};
 	};
 
+export type IssueStateChangeWebhook =
+	LinearSDK.LinearDocument.EntityWebhookPayload & {
+		type: "Issue";
+		action: "update";
+		data: LinearSDK.LinearDocument.IssueWebhookPayload;
+		updatedFrom: {
+			stateId: string;
+			[key: string]: unknown;
+		};
+	};
+
 /**
  * Platform-agnostic union of all webhook types.
  * Maps to Linear SDK's webhook payload union types.
@@ -927,6 +938,26 @@ export function isIssueTitleOrDescriptionUpdateWebhook(
 		"description" in updatedFrom ||
 		"attachments" in updatedFrom
 	);
+}
+
+export function isIssueStateChangeWebhook(
+	webhook: Webhook,
+): webhook is IssueStateChangeWebhook {
+	if (webhook.type !== "Issue" || webhook.action !== "update") {
+		return false;
+	}
+
+	const entityWebhook =
+		webhook as LinearSDK.LinearDocument.EntityWebhookPayload;
+	const updatedFrom = entityWebhook.updatedFrom as
+		| { stateId?: string }
+		| undefined;
+
+	if (!updatedFrom) {
+		return false;
+	}
+
+	return "stateId" in updatedFrom;
 }
 
 /**
