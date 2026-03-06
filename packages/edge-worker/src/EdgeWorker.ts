@@ -47,6 +47,7 @@ import type {
 	WebhookIssue,
 } from "cyrus-core";
 import {
+	AgentSessionStatus,
 	CLIIssueTrackerService,
 	CLIRPCServer,
 	createLogger,
@@ -2878,6 +2879,20 @@ ${taskSection}`;
 			return;
 		}
 
+		if (!isMentionTriggered && this.config.issueStateChangeTrigger === true) {
+			log.info(
+				`Delegation for ${issue.identifier}: state-change mode active, caching repo routing only`,
+			);
+			return;
+		}
+
+		if (this.hasActiveSessionForIssue(issue.id)) {
+			log.info(
+				`Skipping new session for ${issue.identifier}: active session already exists`,
+			);
+			return;
+		}
+
 		// Check if the comment contains the /label-based-prompt command
 		const isLabelBasedPromptRequested = commentBody?.includes(
 			"/label-based-prompt",
@@ -3851,6 +3866,13 @@ ${taskSection}`;
 			return;
 		}
 
+		if (this.hasActiveSessionForIssue(issueId)) {
+			this.logger.info(
+				`Skipping state change for ${issueIdentifier}: active session already exists`,
+			);
+			return;
+		}
+
 		await this.stopExistingSessionsForIssue(issueId, repository);
 		await this.launchStateChangeSession(
 			issueId,
@@ -3925,6 +3947,16 @@ ${taskSection}`;
 		this.logger.info(
 			`Stopped ${activeThreadCount} sessions for issue ${issueIdentifier} (state → ${stateName})`,
 		);
+	}
+
+	private hasActiveSessionForIssue(issueId: string): boolean {
+		for (const manager of this.agentSessionManagers.values()) {
+			const sessions = manager.getSessionsByIssueId(issueId);
+			if (sessions.some((s) => s.status === AgentSessionStatus.Active)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private async stopExistingSessionsForIssue(
@@ -4178,7 +4210,7 @@ ${taskSection}`;
 			await issueTracker.updateIssue(issueId, { stateId: targetState.id });
 			setTimeout(() => {
 				this.pendingAgentStateChanges.delete(issueId);
-			}, 30_000);
+			}, 120_000);
 
 			log.info(
 				`Moved issue to "${targetStateName}" after "${completedSubroutineName}" subroutine`,
@@ -4510,7 +4542,7 @@ ${taskSection}`;
 
 			setTimeout(() => {
 				this.pendingAgentStateChanges.delete(issue.id);
-			}, 30_000);
+			}, 120_000);
 
 			this.logger.debug(
 				`Successfully moved issue ${issue.identifier} to ${startedState.name} state`,
